@@ -1,4 +1,5 @@
 import type { GenerateVideoRequest, VideoGenerationResponse } from '../types';
+import { getAuthHeaders } from './authService';
 
 export async function generateVideo(
   request: GenerateVideoRequest,
@@ -10,10 +11,6 @@ export async function generateVideo(
   formData.append('ratio', request.ratio);
   formData.append('duration', String(request.duration));
 
-  if (request.sessionId) {
-    formData.append('sessionId', request.sessionId);
-  }
-
   for (const file of request.files) {
     formData.append('files', file);
   }
@@ -22,6 +19,7 @@ export async function generateVideo(
   onProgress?.('正在提交视频生成请求...');
   const submitRes = await fetch('/api/generate-video', {
     method: 'POST',
+    headers: getAuthHeaders(),
     body: formData,
   });
 
@@ -60,7 +58,6 @@ export async function generateVideo(
       throw new Error(pollData.error || '视频生成失败');
     }
 
-    // 仍在处理中，更新进度
     if (pollData.progress) {
       onProgress?.(pollData.progress);
     }

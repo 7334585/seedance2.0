@@ -6,6 +6,19 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import browserService from './browser-service.js';
+import { initDatabase, getDatabase, closeDatabase } from './database/index.js';
+import * as projectService from './services/projectService.js';
+import * as taskService from './services/taskService.js';
+import * as settingsService from './services/settingsService.js';
+import * as batchService from './services/batchScheduler.js';
+import * as videoDownloader from './services/videoDownloader.js';
+import { generateSeedanceVideo as generateSeedanceVideoCore } from './services/videoGenerator.js';
+import * as authService from './services/authService.js';
+import * as jimengSessionService from './services/jimengSessionService.js';
+import { readFileSync } from 'fs';
+
+// 初始化数据库
+initDatabase();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -29,6 +42,77 @@ const VERSION_CODE = '8.4.0';
 const PLATFORM_CODE = '7';
 const WEB_ID = Math.random() * 999999999999999999 + 7000000000000000000;
 const USER_ID = crypto.randomUUID().replace(/-/g, '');
+const downloadTokens = new Map();
+const DOWNLOAD_TOKEN_TTL_MS = 60 * 1000;
+
+function cleanupExpiredDownloadTokens() {
+  const now = Date.now();
+  for (const [token, record] of downloadTokens.entries()) {
+    if (record.expiresAt <= now) {
+      downloadTokens.delete(token);
+    }
+  }
+}
+
+function createDownloadToken(taskId, userId) {
+  cleanupExpiredDownloadTokens();
+  const token = crypto.randomBytes(24).toString('hex');
+  downloadTokens.set(token, {
+    taskId: String(taskId),
+    userId: Number(userId),
+    expiresAt: Date.now() + DOWNLOAD_TOKEN_TTL_MS,
+  });
+  return token;
+}
+
+function consumeDownloadToken(token, userId = null) {
+  cleanupExpiredDownloadTokens();
+  const record = downloadTokens.get(token);
+  if (!record) {
+    return null;
+  }
+  if (record.expiresAt <= Date.now()) {
+    downloadTokens.delete(token);
+    return null;
+  }
+  if (userId !== null && record.userId !== Number(userId)) {
+    downloadTokens.delete(token);
+    return null;
+  }
+  downloadTokens.delete(token);
+  return record;
+}
+
+setInterval(cleanupExpiredDownloadTokens, DOWNLOAD_TOKEN_TTL_MS).unref();
+
+// 认证中间件
+const authenticate = async (req, res, next) => {
+  const sessionId = req.headers['x-session-id'];
+
+  if (!sessionId) {
+    return res.status(401).json({ error: '未登录' });
+  }
+
+  try {
+    const user = await authService.getCurrentUser(sessionId);
+    if (!user) {
+      return res.status(401).json({ error: 'Session 已过期或无效' });
+    }
+    req.user = user;
+    req.sessionId = sessionId; // 保存原始 sessionId 供后续使用
+    next();
+  } catch (error) {
+    res.status(401).json({ error: '认证失败' });
+  }
+};
+
+// 管理员认证中间件
+const requireAdmin = (req, res, next) => {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ error: '需要管理员权限' });
+  }
+  next();
+};
 
 const FAKE_HEADERS = {
   Accept: 'application/json, text/plain, */*',
@@ -84,6 +168,208 @@ const VIDEO_RESOLUTION = {
 // ============================================================
 const tasks = new Map();
 let taskCounter = 0;
+
+function getMissingSessionErrorMessage() {
+  return '未配置可用的 SessionID，请在设置页添加并设为默认账号';
+}
+
+function ensureDefaultProjectForUser(userId) {
+  const db = getDatabase();
+  const existingProject = db.prepare(`
+    SELECT * FROM projects
+    WHERE user_id = ? AND name = ?
+    ORDER BY id ASC
+    LIMIT 1
+  `).get(userId, '默认项目');
+
+  if (existingProject) {
+    return existingProject;
+  }
+
+  return projectService.createProject({
+    name: '默认项目',
+    description: '单任务生成默认项目',
+    user_id: userId,
+  });
+}
+
+function validateBatchTasks(projectId, taskIds, userId = null, isAdmin = false) {
+  const project = projectService.getProjectById(projectId, userId, isAdmin);
+  if (!project) {
+    return { error: '项目不存在', statusCode: 404 };
+  }
+
+  const normalizedTaskIds = [...new Set(taskIds.map((id) => Number(id)).filter((id) => Number.isInteger(id) && id > 0))];
+  if (normalizedTaskIds.length === 0) {
+    return { error: '请选择有效任务', statusCode: 400 };
+  }
+
+  const invalidTasks = [];
+  for (const taskId of normalizedTaskIds) {
+    const task = taskService.getTaskById(taskId, userId, isAdmin);
+    if (!task) {
+      invalidTasks.push({ taskId, prompt: '', reason: '任务不存在' });
+      continue;
+    }
+    if (Number(task.project_id) !== Number(projectId)) {
+      invalidTasks.push({ taskId, prompt: task.prompt || '', reason: '任务不属于当前项目' });
+      continue;
+    }
+    if (task.task_kind !== 'draft') {
+      invalidTasks.push({ taskId, prompt: task.prompt || '', reason: '只能启动草稿任务' });
+      continue;
+    }
+    if (!String(task.prompt || '').trim()) {
+      invalidTasks.push({ taskId, prompt: task.prompt || '', reason: '任务缺少提示词' });
+      continue;
+    }
+
+    const imageAssets = taskService.getTaskAssets(taskId).filter((asset) => asset.asset_type === 'image');
+    if (imageAssets.length === 0) {
+      invalidTasks.push({ taskId, prompt: task.prompt || '', reason: '任务缺少图片素材' });
+    }
+  }
+
+  return {
+    project,
+    taskIds: normalizedTaskIds,
+    invalidTasks,
+  };
+}
+
+function pickFirstArray(...values) {
+  return values.find((value) => Array.isArray(value) && value.length >= 0) || [];
+}
+
+function extractItemId(item) {
+  return item?.item_id || item?.local_item_id || item?.common_attr?.id || item?.id || null;
+}
+
+function extractHistoryId(item) {
+  return item?.history_id || item?.history_record_id || item?.common_attr?.history_id || item?.item_base?.history_id || null;
+}
+
+function extractVideoUrl(item) {
+  return item?.video?.transcoded_video?.origin?.video_url || item?.video?.download_url || item?.video?.play_url || item?.video?.url || item?.video?.play_addr?.url_list?.[0] || item?.item_video?.url || null;
+}
+
+async function resolveItemIdsByHistoryIds(sessionId, historyIds) {
+  const normalizedHistoryIds = [...new Set(historyIds.map((historyId) => String(historyId || '')).filter(Boolean))];
+  const itemIdByHistoryId = new Map();
+
+  if (normalizedHistoryIds.length === 0) {
+    return itemIdByHistoryId;
+  }
+
+  const historyResult = await jimengRequest('post', '/mweb/v1/get_history_by_ids', sessionId, {
+    data: {
+      history_ids: normalizedHistoryIds,
+    },
+  });
+
+  const historyRecords = [
+    ...pickFirstArray(
+      historyResult?.history_list,
+      historyResult?.list,
+      historyResult?.data?.history_list,
+      historyResult?.data?.list
+    ),
+    ...normalizedHistoryIds
+      .map((historyId) => historyResult?.[historyId] || historyResult?.data?.[historyId] || null)
+      .filter(Boolean),
+  ];
+
+  for (const record of historyRecords) {
+    const historyId = extractHistoryId(record);
+    if (!historyId) {
+      continue;
+    }
+
+    const item = pickFirstArray(record?.item_list, record?.items, record?.data?.item_list)[0];
+    const itemId = extractItemId(item);
+    if (!itemId) {
+      continue;
+    }
+
+    itemIdByHistoryId.set(String(historyId), String(itemId));
+  }
+
+  return itemIdByHistoryId;
+}
+
+async function fetchLocalItemsByItemIds(sessionId, itemIds) {
+  const normalizedItemIds = [...new Set(itemIds.map((itemId) => String(itemId || '')).filter(Boolean))];
+  if (normalizedItemIds.length === 0) {
+    return [];
+  }
+
+  const result = await jimengRequest('post', '/mweb/v1/get_local_item_list', sessionId, {
+    data: {
+      item_id_list: normalizedItemIds,
+      pack_item_opt: {
+        scene: 1,
+        need_data_integrity: true,
+      },
+      is_for_video_download: true,
+    },
+  });
+
+  return pickFirstArray(
+    result?.item_list,
+    result?.local_item_list,
+    result?.list,
+    result?.data?.item_list,
+    result?.data?.local_item_list,
+    result?.data?.list
+  );
+}
+
+async function resolveTaskVideoByHistory(sessionId, task) {
+  const historyId = task?.history_id ? String(task.history_id) : '';
+  if (!historyId) {
+    return { itemId: null, videoUrl: null };
+  }
+
+  const itemId = task?.item_id ? String(task.item_id) : (await resolveItemIdsByHistoryIds(sessionId, [historyId])).get(historyId) || null;
+  if (!itemId) {
+    return { itemId: null, videoUrl: null };
+  }
+
+  const items = await fetchLocalItemsByItemIds(sessionId, [itemId]);
+  const matchedItem = items.find((item) => {
+    const resolvedItemId = extractItemId(item);
+    const resolvedHistoryId = extractHistoryId(item);
+    return String(resolvedItemId || '') === itemId || String(resolvedHistoryId || '') === historyId;
+  }) || items[0];
+
+  return {
+    itemId,
+    videoUrl: matchedItem ? extractVideoUrl(matchedItem) : null,
+  };
+}
+
+function persistResolvedVideoTask(db, taskId, { itemId = null, videoUrl = null }) {
+  if (videoUrl) {
+    db.prepare(`
+      UPDATE tasks
+      SET item_id = COALESCE(?, item_id), video_url = ?, status = 'done', completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(itemId, videoUrl, taskId);
+    return;
+  }
+
+  if (itemId) {
+    db.prepare(`
+      UPDATE tasks
+      SET item_id = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(itemId, taskId);
+  }
+}
+
+function isOutputTask(task) {
+  return task && task.task_kind === 'output';
+}
 
 function createTaskId() {
   return `task_${++taskCounter}_${Date.now()}`;
@@ -552,401 +838,31 @@ function buildMetaListFromPrompt(prompt, imageCount) {
   return metaList;
 }
 
-// ============================================================
-// Seedance 2.0 视频生成 (完整流程)
-// ============================================================
-async function generateSeedanceVideo(
-  taskId,
-  { prompt, ratio, duration, files, sessionId, model: requestModel }
-) {
-  const task = tasks.get(taskId);
-  const modelKey = requestModel && MODEL_MAP[requestModel] ? requestModel : 'seedance-2.0';
-  const model = MODEL_MAP[modelKey];
-  const benefitType = BENEFIT_TYPE_MAP[modelKey];
-  const actualDuration = duration || 4;
-
-  const resConfig = VIDEO_RESOLUTION[ratio] || VIDEO_RESOLUTION['4:3'];
-  const { width, height } = resConfig;
-
-  console.log(
-    `[${taskId}] ${modelKey}: ${width}x${height} (${ratio}) ${actualDuration}秒`
-  );
-
-  // 第1步: 上传图片
-  task.progress = '正在上传参考图片...';
-  const uploadedImages = [];
-
-  for (let i = 0; i < files.length; i++) {
-    task.progress = `正在上传第 ${i + 1}/${files.length} 张图片...`;
-    console.log(
-      `[${taskId}] 上传图片 ${i + 1}/${files.length}: ${files[i].originalname} (${(files[i].size / 1024).toFixed(1)}KB)`
-    );
-
-    const imageUri = await uploadImageBuffer(files[i].buffer, sessionId);
-    uploadedImages.push({ uri: imageUri, width, height });
-    console.log(`[${taskId}] 图片 ${i + 1} 上传成功`);
-  }
-
-  console.log(
-    `[${taskId}] 全部 ${uploadedImages.length} 张图片上传完成`
-  );
-
-  // 第2步: 构建 material_list 和 meta_list
-  const materialList = uploadedImages.map((img) => ({
-    type: '',
-    id: generateUUID(),
-    material_type: 'image',
-    image_info: {
-      type: 'image',
-      id: generateUUID(),
-      source_from: 'upload',
-      platform_type: 1,
-      name: '',
-      image_uri: img.uri,
-      aigc_image: {
-        type: '',
-        id: generateUUID(),
-      },
-      width: img.width,
-      height: img.height,
-      format: '',
-      uri: img.uri,
-    },
-  }));
-
-  const metaList = buildMetaListFromPrompt(prompt || '', uploadedImages.length);
-
-  const componentId = generateUUID();
-  const submitId = generateUUID();
-
-  // 计算视频宽高比
-  const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
-  const divisor = gcd(width, height);
-  const aspectRatio = `${width / divisor}:${height / divisor}`;
-
-  const metricsExtra = JSON.stringify({
-    isDefaultSeed: 1,
-    originSubmitId: submitId,
-    isRegenerate: false,
-    enterFrom: 'click',
-    position: 'page_bottom_box',
-    functionMode: 'omni_reference',
-    sceneOptions: JSON.stringify([
-      {
-        type: 'video',
-        scene: 'BasicVideoGenerateButton',
-        modelReqKey: model,
-        videoDuration: actualDuration,
-        reportParams: {
-          enterSource: 'generate',
-          vipSource: 'generate',
-          extraVipFunctionKey: model,
-          useVipFunctionDetailsReporterHoc: true,
-        },
-        materialTypes: [1],
-      },
-    ]),
-  });
-
-  // 第3步: 提交生成请求 (通过浏览器代理绕过 shark 反爬)
-  task.progress = '正在提交视频生成请求...';
-  console.log(`[${taskId}] 提交生成请求: model=${model}, benefitType=${benefitType}`);
-
-  const generateQueryParams = new URLSearchParams({
-    aid: String(DEFAULT_ASSISTANT_ID),
-    device_platform: 'web',
-    region: 'cn',
-    webId: String(WEB_ID),
-    da_version: SEEDANCE_DRAFT_VERSION,
-    web_component_open_flag: '1',
-    web_version: '7.5.0',
-    aigc_features: 'app_lip_sync',
-  });
-  const generateUrl = `${JIMENG_BASE_URL}/mweb/v1/aigc_draft/generate?${generateQueryParams}`;
-
-  const generateBody = {
-    extend: {
-      root_model: model,
-      m_video_commerce_info: {
-        benefit_type: benefitType,
-        resource_id: 'generate_video',
-        resource_id_type: 'str',
-        resource_sub_type: 'aigc',
-      },
-      m_video_commerce_info_list: [
-        {
-          benefit_type: benefitType,
-          resource_id: 'generate_video',
-          resource_id_type: 'str',
-          resource_sub_type: 'aigc',
-        },
-      ],
-    },
-    submit_id: submitId,
-    metrics_extra: metricsExtra,
-    draft_content: JSON.stringify({
-      type: 'draft',
-      id: generateUUID(),
-      min_version: SEEDANCE_DRAFT_VERSION,
-      min_features: ['AIGC_Video_UnifiedEdit'],
-      is_from_tsn: true,
-      version: SEEDANCE_DRAFT_VERSION,
-      main_component_id: componentId,
-      component_list: [
-        {
-          type: 'video_base_component',
-          id: componentId,
-          min_version: '1.0.0',
-          aigc_mode: 'workbench',
-          metadata: {
-            type: '',
-            id: generateUUID(),
-            created_platform: 3,
-            created_platform_version: '',
-            created_time_in_ms: String(Date.now()),
-            created_did: '',
-          },
-          generate_type: 'gen_video',
-          abilities: {
-            type: '',
-            id: generateUUID(),
-            gen_video: {
-              type: '',
-              id: generateUUID(),
-              text_to_video_params: {
-                type: '',
-                id: generateUUID(),
-                video_gen_inputs: [
-                  {
-                    type: '',
-                    id: generateUUID(),
-                    min_version: SEEDANCE_DRAFT_VERSION,
-                    prompt: '',
-                    video_mode: 2,
-                    fps: 24,
-                    duration_ms: actualDuration * 1000,
-                    idip_meta_list: [],
-                    unified_edit_input: {
-                      type: '',
-                      id: generateUUID(),
-                      material_list: materialList,
-                      meta_list: metaList,
-                    },
-                  },
-                ],
-                video_aspect_ratio: aspectRatio,
-                seed: Math.floor(Math.random() * 1000000000),
-                model_req_key: model,
-                priority: 0,
-              },
-              video_task_extra: metricsExtra,
-            },
-          },
-          process_type: 1,
-        },
-      ],
-    }),
-    http_common_info: {
-      aid: DEFAULT_ASSISTANT_ID,
-    },
-  };
-
-  const generateResult = await browserService.fetch(
-    sessionId,
-    WEB_ID,
-    USER_ID,
-    generateUrl,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(generateBody),
-    }
-  );
-
-  // 解析浏览器代理返回的结果
-  if (generateResult.ret !== undefined && String(generateResult.ret) !== '0') {
-    const retCode = String(generateResult.ret);
-    const errMsg = generateResult.errmsg || retCode;
-    if (retCode === '5000') throw new Error('即梦积分不足，请前往即梦官网领取积分');
-    throw new Error(`即梦API错误 (ret=${retCode}): ${errMsg}`);
-  }
-
-  const aigcData = generateResult.data?.aigc_data;
-  const historyId = aigcData?.history_record_id;
-  if (!historyId) throw new Error('未获取到记录ID');
-
-  console.log(`[${taskId}] 生成请求已提交, historyId: ${historyId}`);
-
-  // 第4步: 轮询获取结果
-  task.progress = '已提交，等待AI生成视频...';
-  await new Promise((r) => setTimeout(r, 5000));
-
-  let status = 20;
-  let failCode;
-  let itemList = [];
-  const maxRetries = 60;
-
-  for (let retryCount = 0; retryCount < maxRetries && status === 20; retryCount++) {
-    try {
-      const result = await jimengRequest(
-        'post',
-        '/mweb/v1/get_history_by_ids',
-        sessionId,
-        { data: { history_ids: [historyId] } }
-      );
-
-      const historyData = result?.history_list?.[0] || result?.[historyId];
-
-      if (!historyData) {
-        const waitTime = Math.min(2000 * (retryCount + 1), 30000);
-        console.log(
-          `[${taskId}] 轮询 #${retryCount + 1}: 数据不存在，等待 ${waitTime}ms`
-        );
-        await new Promise((r) => setTimeout(r, waitTime));
-        continue;
-      }
-
-      status = historyData.status;
-      failCode = historyData.fail_code;
-      itemList = historyData.item_list || [];
-
-      const elapsed = Math.floor((Date.now() - task.startTime) / 1000);
-      const mins = Math.floor(elapsed / 60);
-      const secs = elapsed % 60;
-
-      console.log(
-        `[${taskId}] 轮询 #${retryCount + 1}: status=${status}, ${mins}分${secs}秒`
-      );
-
-      if (status === 30) {
-        throw new Error(
-          failCode === 2038
-            ? '内容被过滤，请修改提示词后重试'
-            : `视频生成失败，错误码: ${failCode}`
-        );
-      }
-
-      if (status === 20) {
-        if (elapsed < 120) {
-          task.progress = 'AI正在生成视频，请耐心等待...';
-        } else {
-          task.progress = `视频生成中，已等待 ${mins} 分钟...`;
-        }
-        const waitTime = 2000 * Math.min(retryCount + 1, 5);
-        await new Promise((r) => setTimeout(r, waitTime));
-      }
-    } catch (error) {
-      if (
-        error.message?.includes('内容被过滤') ||
-        error.message?.includes('生成失败')
-      )
-        throw error;
-      console.log(`[${taskId}] 轮询出错: ${error.message}`);
-      await new Promise((r) => setTimeout(r, 2000 * (retryCount + 1)));
-    }
-  }
-
-  if (status === 20)
-    throw new Error('视频生成超时 (约20分钟)，请稍后重试');
-
-  // 第5步: 获取高清视频URL
-  task.progress = '正在获取高清视频...';
-  const itemId =
-    itemList?.[0]?.item_id ||
-    itemList?.[0]?.id ||
-    itemList?.[0]?.local_item_id ||
-    itemList?.[0]?.common_attr?.id;
-
-  if (itemId) {
-    try {
-      const hqResult = await jimengRequest(
-        'post',
-        '/mweb/v1/get_local_item_list',
-        sessionId,
-        {
-          data: {
-            item_id_list: [String(itemId)],
-            pack_item_opt: { scene: 1, need_data_integrity: true },
-            is_for_video_download: true,
-          },
-        }
-      );
-
-      const hqItemList =
-        hqResult?.item_list || hqResult?.local_item_list || [];
-      const hqItem = hqItemList[0];
-      const hqUrl =
-        hqItem?.video?.transcoded_video?.origin?.video_url ||
-        hqItem?.video?.download_url ||
-        hqItem?.video?.play_url ||
-        hqItem?.video?.url;
-
-      if (hqUrl) {
-        console.log(`[${taskId}] 高清视频URL获取成功`);
-        return hqUrl;
-      }
-
-      // 正则匹配兜底
-      const responseStr = JSON.stringify(hqResult);
-      const urlMatch =
-        responseStr.match(
-          /https:\/\/v[0-9]+-dreamnia\.jimeng\.com\/[^"\s\\]+/
-        ) ||
-        responseStr.match(
-          /https:\/\/v[0-9]+-[^"\\]*\.jimeng\.com\/[^"\s\\]+/
-        );
-      if (urlMatch?.[0]) {
-        console.log(`[${taskId}] 正则提取到高清视频URL`);
-        return urlMatch[0];
-      }
-    } catch (err) {
-      console.log(
-        `[${taskId}] 获取高清URL失败，使用预览URL: ${err.message}`
-      );
-    }
-  }
-
-  // 回退使用预览URL
-  const videoUrl =
-    itemList?.[0]?.video?.transcoded_video?.origin?.video_url ||
-    itemList?.[0]?.video?.play_url ||
-    itemList?.[0]?.video?.download_url ||
-    itemList?.[0]?.video?.url;
-
-  if (!videoUrl) throw new Error('未能获取视频URL');
-
-  console.log(`[${taskId}] 视频URL (预览): ${videoUrl}`);
-  return videoUrl;
-}
 
 // ============================================================
 // Express 路由
 // ============================================================
 
 // POST /api/generate-video - 提交任务, 立即返回 taskId
-app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
+app.post('/api/generate-video', authenticate, upload.array('files', 5), async (req, res) => {
   const startTime = Date.now();
+  let dbTaskId = null;
 
   try {
-    const { prompt, ratio, duration, sessionId, model } = req.body;
+    const { prompt, ratio, duration, model } = req.body;
     const files = req.files;
 
-    // 认证检查
-    const authToken = sessionId || DEFAULT_SESSION_ID;
-    if (!authToken) {
-      return res
-        .status(401)
-        .json({ error: '未配置 Session ID，请在设置中填写' });
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    if (!resolvedSession.sessionId) {
+      return res.status(401).json({ error: getMissingSessionErrorMessage() });
     }
 
-    // Seedance 2.0 需要至少一张图片
     if (!Array.isArray(files) || files.length === 0) {
       return res
         .status(400)
         .json({ error: 'Seedance 2.0 需要至少上传一张参考图片' });
     }
 
-    // 创建任务
     const taskId = createTaskId();
     const task = {
       id: taskId,
@@ -958,46 +874,147 @@ app.post('/api/generate-video', upload.array('files', 5), async (req, res) => {
     };
     tasks.set(taskId, task);
 
+    try {
+      const defaultProject = ensureDefaultProjectForUser(req.user.id);
+      const createdTask = taskService.createTask({
+        projectId: defaultProject.id,
+        userId: req.user.id,
+        prompt: prompt || '',
+        taskKind: 'output',
+        status: 'generating',
+        downloadStatus: 'pending',
+        progress: '正在准备...',
+        startedAt: new Date().toISOString(),
+      });
+      dbTaskId = createdTask.id;
+      console.log(`[生成任务] 数据库记录已创建，db_task_id = ${dbTaskId}, project_id = ${defaultProject.id}`);
+    } catch (dbError) {
+      console.error('[生成任务] 创建数据库记录失败:', dbError.message);
+    }
+
     console.log(`\n========== [${taskId}] 收到视频生成请求 ==========`);
     console.log(`  prompt: ${(prompt || '').substring(0, 80)}${(prompt || '').length > 80 ? '...' : ''}`);
     console.log(`  model: ${model || 'seedance-2.0'}, ratio: ${ratio || '4:3'}, duration: ${duration || 4}秒`);
     console.log(`  files: ${files.length}张`);
+    console.log(`  session source: ${resolvedSession.source}`);
     files.forEach((f, i) => {
       console.log(
         `  file[${i}]: ${f.originalname} (${f.mimetype}, ${(f.size / 1024).toFixed(1)}KB)`
       );
     });
 
-    // 立即返回 taskId
-    res.json({ taskId });
+    res.json({ taskId, dbTaskId });
 
-    // 后台执行视频生成
-    generateSeedanceVideo(taskId, {
+    generateSeedanceVideoCore({
       prompt,
       ratio: ratio || '4:3',
       duration: parseInt(duration) || 4,
       files,
-      sessionId: authToken,
+      sessionId: resolvedSession.sessionId,
       model: model || 'seedance-2.0',
+      onProgress: async (progress) => {
+        task.progress = progress;
+        console.log(`[${taskId}] 进度：${progress}`);
+        if (dbTaskId) {
+          try {
+            taskService.updateTask(dbTaskId, { progress });
+          } catch (dbError) {
+            console.error('[生成任务] 保存进度失败:', dbError.message);
+          }
+        }
+      },
+      onSubmitId: async (submitId) => {
+        if (dbTaskId) {
+          try {
+            taskService.updateTask(dbTaskId, {
+              submit_id: submitId,
+              submitted_at: new Date().toISOString(),
+            });
+            console.log(`[生成任务] submitId 已保存到数据库：${submitId}`);
+          } catch (dbError) {
+            console.error('[生成任务] 保存 submitId 失败:', dbError.message);
+          }
+        }
+      },
+      onHistoryId: async (historyId) => {
+        if (dbTaskId) {
+          try {
+            taskService.updateTask(dbTaskId, {
+              history_id: historyId,
+              status: 'generating',
+            });
+            console.log(`[生成任务] historyId 已保存到数据库：${historyId}`);
+          } catch (dbError) {
+            console.error('[生成任务] 保存 historyId 失败:', dbError.message);
+          }
+        }
+      },
+      onItemId: async (itemId) => {
+        if (dbTaskId) {
+          try {
+            taskService.updateTask(dbTaskId, { item_id: itemId });
+            console.log(`[生成任务] itemId 已保存到数据库：${itemId}`);
+          } catch (dbError) {
+            console.error('[生成任务] 保存 itemId 失败:', dbError.message);
+          }
+        }
+      },
+      onVideoReady: async (videoUrl) => {
+        if (dbTaskId) {
+          try {
+            taskService.updateTask(dbTaskId, { video_url: videoUrl });
+          } catch (dbError) {
+            console.error('[生成任务] 保存 videoUrl 失败:', dbError.message);
+          }
+        }
+      },
     })
-      .then((videoUrl) => {
+      .then((result) => {
         task.status = 'done';
         task.result = {
           created: Math.floor(Date.now() / 1000),
-          data: [{ url: videoUrl, revised_prompt: prompt || '' }],
+          data: [{ url: result.videoUrl, revised_prompt: result.revisedPrompt || prompt || '' }],
         };
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(
-          `========== [${taskId}] ✅ 视频生成成功 (${elapsed}秒) ==========\n`
+          `========== [${taskId}] ✅ 视频生成成功 (${elapsed}秒) ==========` + '\n'
         );
+
+        if (dbTaskId) {
+          try {
+            taskService.updateTaskStatus(dbTaskId, 'done', {
+              submit_id: result.submitId || null,
+              history_id: result.historyId || null,
+              item_id: result.itemId || null,
+              video_url: result.videoUrl,
+              progress: '',
+              error_message: null,
+            });
+            console.log('[生成任务] 数据库记录已更新，status = done');
+          } catch (dbError) {
+            console.error('[生成任务] 更新数据库记录失败:', dbError.message);
+          }
+        }
       })
       .catch((err) => {
         task.status = 'error';
         task.error = err.message || '视频生成失败';
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         console.error(
-          `========== [${taskId}] ❌ 视频生成失败 (${elapsed}秒): ${err.message} ==========\n`
+          `========== [${taskId}] ❌ 视频生成失败 (${elapsed}秒): ${err.message} ==========` + '\n'
         );
+
+        if (dbTaskId) {
+          try {
+            taskService.updateTaskStatus(dbTaskId, 'error', {
+              progress: '',
+              error_message: err.message,
+            });
+            console.log('[生成任务] 数据库记录已更新，status = error');
+          } catch (dbError) {
+            console.error('[生成任务] 更新数据库记录失败:', dbError.message);
+          }
+        }
       });
   } catch (error) {
     console.error(`请求处理错误: ${error.message}`);
@@ -1097,6 +1114,1896 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: err.message || '服务器内部错误' });
 });
 
+// ============================================================
+// 批量管理功能 API 路由
+// ============================================================
+
+// -------------------- 项目管理 --------------------
+// GET /api/projects - 获取项目列表
+app.get('/api/projects', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const projects = projectService.getAllProjects(req.user.id, isAdmin);
+    res.json({ success: true, data: projects });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/projects - 创建项目
+app.post('/api/projects', authenticate, (req, res) => {
+  try {
+    const { name, description, settings } = req.body;
+    if (!name) {
+      return res.status(400).json({ error: '项目名称不能为空' });
+    }
+    const project = projectService.createProject({ name, description, settings, user_id: req.user.id });
+    res.json({ success: true, data: project });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/projects/:id - 获取项目详情
+app.get('/api/projects/:id', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const project = projectService.getProjectById(req.params.id, req.user.id, isAdmin);
+    if (!project) {
+      return res.status(404).json({ error: '项目不存在或无权访问' });
+    }
+    res.json({ success: true, data: project });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/projects/:id - 更新项目
+app.put('/api/projects/:id', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const project = projectService.getProjectById(req.params.id, req.user.id, isAdmin);
+    if (!project) {
+      return res.status(404).json({ error: '项目不存在或无权访问' });
+    }
+    // 非管理员只能更新自己的项目
+    if (!isAdmin && project.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权修改此项目' });
+    }
+    const { name, description, settings, video_save_path, default_concurrent, default_min_interval, default_max_interval } = req.body;
+    const updated = projectService.updateProject(req.params.id, {
+      name,
+      description,
+      settings_json: settings ? JSON.stringify(settings) : undefined,
+      video_save_path,
+      default_concurrent,
+      default_min_interval,
+      default_max_interval,
+    });
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/projects/:id - 删除项目
+app.delete('/api/projects/:id', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const project = projectService.getProjectById(req.params.id, req.user.id, isAdmin);
+    if (!project) {
+      return res.status(404).json({ error: '项目不存在或无权访问' });
+    }
+    // 非管理员只能删除自己的项目
+    if (!isAdmin && project.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权删除此项目' });
+    }
+    projectService.deleteProject(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/projects/:id/tasks - 获取项目下的任务列表
+app.get('/api/projects/:id/tasks', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const project = projectService.getProjectById(req.params.id, req.user.id, isAdmin);
+    if (!project) {
+      return res.status(404).json({ success: false, error: '项目不存在或无权访问' });
+    }
+
+    const { status, taskKind, sourceTaskId, rowGroupId } = req.query;
+    const tasks = taskService.getTasksByProjectId(req.params.id, {
+      status: typeof status === 'string' ? status : undefined,
+      taskKind: typeof taskKind === 'string' ? taskKind : undefined,
+      sourceTaskId: sourceTaskId !== undefined ? Number(sourceTaskId) : undefined,
+      rowGroupId: typeof rowGroupId === 'string' ? rowGroupId : undefined,
+    }, req.user.id, isAdmin);
+    res.json({ success: true, data: tasks });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// -------------------- 任务管理 --------------------
+// GET /api/tasks/:id - 获取任务详情
+app.get('/api/tasks/:id', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    res.json({ success: true, data: task });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/projects/:projectId/tasks - 创建任务
+app.post('/api/projects/:projectId/tasks', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const project = projectService.getProjectById(req.params.projectId, req.user.id, isAdmin);
+    if (!project) {
+      return res.status(404).json({ success: false, error: '项目不存在或无权访问' });
+    }
+    // 非管理员只能在自己的项目中创建任务
+    if (!isAdmin && project.user_id !== req.user.id) {
+      return res.status(403).json({ success: false, error: '无权在此项目中创建任务' });
+    }
+
+    const {
+      prompt = '',
+      taskKind = 'output',
+      rowIndex,
+      videoCount,
+      sourceTaskId,
+      rowGroupId,
+      outputIndex,
+    } = req.body || {};
+
+    if (taskKind !== 'draft' && !String(prompt).trim()) {
+      return res.status(400).json({ success: false, error: '任务提示词不能为空' });
+    }
+
+    const task = taskService.createTask({
+      projectId: req.params.projectId,
+      prompt,
+      taskKind,
+      rowIndex,
+      videoCount,
+      sourceTaskId,
+      rowGroupId,
+      outputIndex,
+      userId: req.user.id,
+    });
+    res.json({ success: true, data: task });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// PUT /api/tasks/:id - 更新任务
+app.put('/api/tasks/:id', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能更新自己的任务
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权修改此任务' });
+    }
+    const updates = req.body;
+    const updated = taskService.updateTask(req.params.id, updates);
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/tasks/:id - 删除任务
+app.delete('/api/tasks/:id', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能删除自己的任务
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权删除此任务' });
+    }
+    taskService.deleteTask(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/tasks/:id/assets - 添加任务素材
+app.post('/api/tasks/:id/assets', authenticate, upload.fields([
+  { name: 'images', maxCount: 5 },
+  { name: 'audios', maxCount: 2 },
+]), async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能为自己的任务添加素材
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权为此任务添加素材' });
+    }
+
+    const files = req.files;
+    const results = [];
+
+    // 处理图片
+    if (files.images) {
+      for (const file of files.images) {
+        const saveDir = path.join(__dirname, '../data/assets/tasks', req.params.id);
+        const filename = `${Date.now()}_${file.originalname}`;
+
+        // 确保目录存在
+        const fs = await import('fs');
+        if (!fs.existsSync(saveDir)) {
+          fs.mkdirSync(saveDir, { recursive: true });
+        }
+
+        const filePath = path.join(saveDir, filename);
+        fs.writeFileSync(filePath, file.buffer);
+
+        const asset = taskService.addTaskAsset(req.params.id, {
+          assetType: 'image',
+          filePath,
+          sortOrder: results.filter(r => r.asset_type === 'image').length,
+        });
+        results.push(asset);
+      }
+    }
+
+    // 处理音频
+    if (files.audios) {
+      for (const file of files.audios) {
+        const saveDir = path.join(__dirname, '../data/assets/tasks', req.params.id);
+        const filename = `${Date.now()}_${file.originalname}`;
+
+        const fs = await import('fs');
+        if (!fs.existsSync(saveDir)) {
+          fs.mkdirSync(saveDir, { recursive: true });
+        }
+
+        const filePath = path.join(saveDir, filename);
+        fs.writeFileSync(filePath, file.buffer);
+
+        const asset = taskService.addTaskAsset(req.params.id, {
+          assetType: 'audio',
+          filePath,
+          sortOrder: results.filter(r => r.asset_type === 'audio').length,
+        });
+        results.push(asset);
+      }
+    }
+
+    res.json({ success: true, data: results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/tasks/:id/assets - 获取任务素材列表
+app.get('/api/tasks/:id/assets', (req, res) => {
+  try {
+    const assets = taskService.getTaskAssets(req.params.id);
+    res.json({ success: true, data: assets });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/tasks/assets/:assetId - 删除任务素材
+app.delete('/api/tasks/assets/:assetId', (req, res) => {
+  try {
+    taskService.deleteTaskAsset(req.params.assetId);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/tasks/:id/generate - 单个任务生成
+app.post('/api/tasks/:id/generate', authenticate, async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在' });
+    }
+
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    const sessionId = resolvedSession.sessionId;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: getMissingSessionErrorMessage() });
+    }
+
+    if (task.task_kind === 'draft') {
+      const validation = validateBatchTasks(task.project_id, [task.id], req.user.id, isAdmin);
+      if (validation.error) {
+        return res.status(validation.statusCode || 400).json({ success: false, error: validation.error });
+      }
+      if (validation.invalidTasks.length > 0) {
+        return res.status(400).json({
+          success: false,
+          error: validation.invalidTasks[0]?.reason || '当前任务无法启动生成',
+          invalidTasks: validation.invalidTasks,
+        });
+      }
+
+      const activeOutputTasks = taskService
+        .getOutputTasksBySourceTaskId(task.id)
+        .filter((outputTask) => !['done', 'error', 'cancelled'].includes(outputTask.status));
+      if (activeOutputTasks.length > 0) {
+        return res.status(400).json({ success: false, error: '该任务行已有生成中的记录，请等待当前任务结束后再试' });
+      }
+
+      const outputTasks = taskService.expandDraftTaskToOutputTasks(task.id);
+      if (outputTasks.length === 0) {
+        return res.status(400).json({ success: false, error: '没有可启动的输出任务' });
+      }
+
+      const batchId = batchService.createBatch({
+        projectId: Number(task.project_id),
+        taskIds: outputTasks.map((outputTask) => outputTask.id),
+        name: `row-${task.id}`,
+        concurrent: Math.max(1, Number(task.video_count) || 1),
+      });
+
+      await batchService.startBatch(batchId, {
+        sessionId,
+        onProgress: (data) => {
+          console.log('[row-batch] 进度更新:', data);
+        },
+        onTaskComplete: (data) => {
+          console.log('[row-batch] 任务完成:', data);
+        },
+        onBatchComplete: (data) => {
+          console.log('[row-batch] 批量任务完成:', data);
+        },
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          taskId: Number(task.id),
+          batchId,
+          totalTasks: outputTasks.length,
+          outputTaskIds: outputTasks.map((outputTask) => outputTask.id),
+          message: '任务生成已启动',
+        },
+      });
+    }
+
+    const assets = taskService.getTaskAssets(req.params.id);
+    const imageAssets = assets.filter(a => a.asset_type === 'image');
+    const settings = settingsService.getAllSettings();
+
+    if (imageAssets.length === 0) {
+      return res.status(400).json({ error: '任务没有图片素材，请至少上传一张参考图片' });
+    }
+
+    const files = [];
+    for (const asset of imageAssets) {
+      try {
+        const buffer = readFileSync(asset.file_path);
+        files.push({
+          buffer,
+          originalname: asset.file_path.split('/').pop(),
+          size: buffer.length,
+        });
+      } catch (err) {
+        console.error(`读取图片文件失败：${asset.file_path}`, err.message);
+      }
+    }
+
+    if (files.length === 0) {
+      return res.status(400).json({ error: '没有可用的图片文件' });
+    }
+
+    taskService.updateTaskStatus(task.id, 'generating', {
+      task_kind: 'output',
+      progress: '正在准备...',
+      error_message: null,
+      submit_id: null,
+      history_id: null,
+      item_id: null,
+      video_url: null,
+      completed_at: null,
+      submitted_at: null,
+    });
+
+    res.json({
+      success: true,
+      data: {
+        taskId: Number(task.id),
+        message: '任务生成已启动',
+      },
+    });
+
+    generateSeedanceVideoCore({
+      prompt: task.prompt,
+      ratio: settings.ratio || '16:9',
+      duration: parseInt(settings.duration) || 5,
+      files,
+      sessionId,
+      model: settings.model || 'seedance-2.0-fast',
+      onProgress: async (progress) => {
+        console.log(`[task ${task.id}] 进度：${progress}`);
+        try {
+          taskService.updateTask(task.id, { progress });
+        } catch (err) {
+          console.error('[任务生成] 保存进度失败:', err.message);
+        }
+      },
+      onSubmitId: async (submitId) => {
+        try {
+          taskService.updateTask(task.id, {
+            submit_id: submitId,
+            submitted_at: new Date().toISOString(),
+          });
+        } catch (err) {
+          console.error('[任务生成] 保存 submitId 失败:', err.message);
+        }
+      },
+      onHistoryId: async (historyId) => {
+        try {
+          taskService.updateTask(task.id, {
+            history_id: historyId,
+            status: 'generating',
+          });
+        } catch (err) {
+          console.error('[任务生成] 保存 historyId 失败:', err.message);
+        }
+      },
+      onItemId: async (itemId) => {
+        try {
+          taskService.updateTask(task.id, { item_id: itemId });
+        } catch (err) {
+          console.error('[任务生成] 保存 itemId 失败:', err.message);
+        }
+      },
+      onVideoReady: async (videoUrl) => {
+        try {
+          taskService.updateTask(task.id, { video_url: videoUrl });
+        } catch (err) {
+          console.error('[任务生成] 保存 videoUrl 失败:', err.message);
+        }
+      },
+    })
+      .then((result) => {
+        taskService.updateTaskStatus(task.id, 'done', {
+          submit_id: result.submitId || null,
+          history_id: result.historyId || null,
+          item_id: result.itemId || null,
+          video_url: result.videoUrl,
+          progress: '',
+          error_message: null,
+        });
+        console.log(`[task ${task.id}] 视频生成成功：${result.videoUrl}`);
+      })
+      .catch((err) => {
+        taskService.updateTaskStatus(task.id, 'error', {
+          progress: '',
+          error_message: err.message,
+        });
+        console.error(`[task ${task.id}] 视频生成失败：${err.message}`);
+      });
+  } catch (error) {
+    console.error(`请求处理错误：${error.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message || '服务器内部错误' });
+    }
+  }
+});
+
+
+// POST /api/tasks/:id/cancel - 取消任务（包括正在生成的任务）
+app.post('/api/tasks/:id/cancel', authenticate, async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能取消自己的任务
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权取消此任务' });
+    }
+
+    const db = getDatabase();
+    const activeBatches = db.prepare(`
+      SELECT id, task_ids
+      FROM batches
+      WHERE status IN ('pending', 'running', 'paused')
+      ORDER BY id DESC
+    `).all();
+
+    const parentBatch = activeBatches.find((batch) => {
+      try {
+        const taskIds = JSON.parse(batch.task_ids || '[]').map(Number);
+        return taskIds.includes(Number(task.id));
+      } catch {
+        return false;
+      }
+    });
+
+    if (parentBatch && await batchService.cancelBatchTask(parentBatch.id, task.id)) {
+      res.json({ success: true, message: '任务取消成功' });
+      return;
+    }
+
+    // 普通任务直接取消
+    taskService.updateTaskStatus(req.params.id, 'cancelled', {
+      progress: '',
+      error_message: '用户取消任务',
+    });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/tasks/:id/collect - 二次采集视频（根据 history_id）
+app.post('/api/tasks/:id/collect', authenticate, async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能采集自己的任务
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权采集此任务' });
+    }
+    if (!isOutputTask(task)) {
+      return res.status(400).json({ error: '只有输出任务可以采集视频' });
+    }
+    if (!task.history_id) {
+      return res.status(400).json({ error: '任务没有 history_id，无法采集' });
+    }
+
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    const sessionId = req.body.sessionId || resolvedSession.sessionId;
+    if (!sessionId) {
+      return res.status(400).json({ error: getMissingSessionErrorMessage() });
+    }
+
+    const resolved = await resolveTaskVideoByHistory(sessionId, task);
+    if (!resolved.itemId) {
+      return res.status(404).json({ error: '即梦 API 未找到该历史记录对应的视频条目' });
+    }
+    if (!resolved.videoUrl) {
+      return res.status(400).json({ error: '历史记录中没有视频 URL，可能还在生成中' });
+    }
+
+    const db = getDatabase();
+    persistResolvedVideoTask(db, task.id, resolved);
+
+    res.json({
+      success: true,
+      data: {
+        videoUrl: resolved.videoUrl,
+        historyId: task.history_id,
+        itemId: resolved.itemId,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/batch/:batchId/collect - 批量二次采集视频
+app.post('/api/batch/:batchId/collect', authenticate, async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const batch = batchService.getBatchById(req.params.batchId, req.user.id, isAdmin);
+    if (!batch) {
+      return res.status(404).json({ error: '批量任务不存在或无权访问' });
+    }
+
+    const taskIds = JSON.parse(batch.task_ids || '[]');
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    const sessionId = req.body.sessionId || resolvedSession.sessionId;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: getMissingSessionErrorMessage() });
+    }
+
+    const db = getDatabase();
+    const candidateTasks = taskIds
+      .map((taskId) => taskService.getTaskById(taskId, req.user.id, isAdmin))
+      .filter((task) => task && isOutputTask(task) && task.history_id && !task.video_url);
+
+    if (candidateTasks.length === 0) {
+      return res.json({
+        success: true,
+        data: { results: [], total: 0, message: '没有需要采集的任务' },
+      });
+    }
+
+    const historyIds = candidateTasks.map((task) => String(task.history_id));
+    const itemIdByHistoryId = await resolveItemIdsByHistoryIds(sessionId, historyIds);
+    const itemIds = [...new Set(candidateTasks.map((task) => task.item_id || itemIdByHistoryId.get(String(task.history_id)) || null).filter(Boolean).map(String))];
+    const items = await fetchLocalItemsByItemIds(sessionId, itemIds);
+
+    const itemByItemId = new Map();
+    const itemByHistoryId = new Map();
+    for (const item of items) {
+      const itemId = extractItemId(item);
+      const historyId = extractHistoryId(item);
+      if (itemId) {
+        itemByItemId.set(String(itemId), item);
+      }
+      if (historyId) {
+        itemByHistoryId.set(String(historyId), item);
+      }
+    }
+
+    const results = candidateTasks.map((task) => {
+      const historyId = String(task.history_id);
+      const itemId = String(task.item_id || itemIdByHistoryId.get(historyId) || '');
+      const item = (itemId && itemByItemId.get(itemId)) || itemByHistoryId.get(historyId) || null;
+      const videoUrl = item ? extractVideoUrl(item) : null;
+
+      persistResolvedVideoTask(db, task.id, {
+        itemId: itemId || null,
+        videoUrl,
+      });
+
+      if (videoUrl) {
+        return {
+          taskId: task.id,
+          success: true,
+          itemId: itemId || null,
+          videoUrl,
+        };
+      }
+
+      return {
+        taskId: task.id,
+        success: false,
+        itemId: itemId || null,
+        error: itemId ? '历史记录中没有视频 URL，可能还在生成中' : '即梦 API 未返回该历史记录，可能仍在生成中',
+      };
+    });
+
+    res.json({
+      success: true,
+      data: { results, total: results.length },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/tasks/:id/download - 下载任务视频
+app.post('/api/tasks/:id/download', authenticate, async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能下载自己的任务
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权下载此任务' });
+    }
+
+    const downloadPath = videoDownloader.getDefaultDownloadPath();
+    const result = await videoDownloader.downloadVideoByTaskId(task.id, downloadPath);
+
+    if (result.success) {
+      res.json({ success: true, data: result });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/tasks/:id/open-folder - 打开视频所在文件夹
+app.post('/api/tasks/:id/open-folder', authenticate, async (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const task = taskService.getTaskById(req.params.id, req.user.id, isAdmin);
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在或无权访问' });
+    }
+    // 非管理员只能打开自己的任务文件夹
+    if (!isAdmin && task.user_id !== req.user.id) {
+      return res.status(403).json({ error: '无权访问此任务' });
+    }
+    if (!task.video_path) {
+      return res.status(400).json({ error: '视频尚未下载' });
+    }
+
+    const result = await videoDownloader.openVideoFolder(task.video_path);
+    if (result.success) {
+      res.json({ success: true });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// -------------------- 批量生成 --------------------
+// POST /api/batch/generate - 创建并启动批量任务
+app.post('/api/batch/generate', authenticate, async (req, res) => {
+  try {
+    const { projectId, taskIds, name = '', concurrent = 5 } = req.body;
+    const isAdmin = req.user.role === 'admin';
+
+    if (!projectId || !Array.isArray(taskIds) || taskIds.length === 0) {
+      return res.status(400).json({ success: false, error: '参数不完整' });
+    }
+
+    const validation = validateBatchTasks(projectId, taskIds, req.user.id, isAdmin);
+    if (validation.error) {
+      return res.status(validation.statusCode || 400).json({ success: false, error: validation.error });
+    }
+    if (validation.invalidTasks.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: '部分任务无法启动批量生成',
+        invalidTasks: validation.invalidTasks,
+      });
+    }
+
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    if (!resolvedSession.sessionId) {
+      return res.status(400).json({ success: false, error: getMissingSessionErrorMessage() });
+    }
+
+    const outputTasks = taskService.expandDraftTasksToOutputTasks(validation.taskIds);
+    if (outputTasks.length === 0) {
+      return res.status(400).json({ success: false, error: '没有可启动的输出任务' });
+    }
+
+    const batchId = batchService.createBatch({
+      projectId: Number(projectId),
+      taskIds: outputTasks.map((task) => task.id),
+      name,
+      concurrent: Number(concurrent) || 5,
+    });
+
+    await batchService.startBatch(batchId, {
+      sessionId: resolvedSession.sessionId,
+      onProgress: (data) => {
+        console.log('[batch] 进度更新:', data);
+      },
+      onTaskComplete: (data) => {
+        console.log('[batch] 任务完成:', data);
+      },
+      onBatchComplete: (data) => {
+        console.log('[batch] 批量任务完成:', data);
+      },
+    });
+
+    res.json({
+      success: true,
+      data: {
+        batchId,
+        totalTasks: outputTasks.length,
+        draftTaskIds: validation.taskIds,
+        outputTaskIds: outputTasks.map((task) => task.id),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// GET /api/batch/:batchId/status - 获取批量任务状态
+app.get('/api/batch/:batchId/status', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const status = batchService.getBatchStatus(req.params.batchId, req.user.id, isAdmin);
+    if (!status) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+    res.json({ success: true, data: status });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/batch/:batchId/pause - 暂停批量任务
+app.post('/api/batch/:batchId/pause', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const batch = batchService.getBatchById(req.params.batchId, req.user.id, isAdmin);
+    if (!batch) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+
+    const result = batchService.pauseBatch(req.params.batchId);
+    if (!result) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/batch/:batchId/resume - 恢复批量任务
+app.post('/api/batch/:batchId/resume', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const batch = batchService.getBatchById(req.params.batchId, req.user.id, isAdmin);
+    if (!batch) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+
+    const result = batchService.resumeBatch(req.params.batchId);
+    if (!result) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// POST /api/batch/:batchId/cancel - 取消批量任务
+app.post('/api/batch/:batchId/cancel', authenticate, (req, res) => {
+  try {
+    const isAdmin = req.user.role === 'admin';
+    const batch = batchService.getBatchById(req.params.batchId, req.user.id, isAdmin);
+    if (!batch) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+
+    const result = batchService.cancelBatch(req.params.batchId);
+    if (!result) {
+      return res.status(404).json({ success: false, error: '批量任务不存在或无权访问' });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+// -------------------- 全局设置 --------------------
+// GET /api/settings - 获取全局设置
+app.get('/api/settings', (req, res) => {
+  try {
+    const settings = settingsService.getAllSettings();
+    res.json({ success: true, data: settings });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/settings - 更新全局设置
+app.put('/api/settings', (req, res) => {
+  try {
+    const settings = req.body;
+    const updated = settingsService.updateSettings(settings);
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/settings/session-accounts - 获取当前用户的 SessionID 账号列表
+app.get('/api/settings/session-accounts', authenticate, (req, res) => {
+  try {
+    const accounts = jimengSessionService.listUserAccounts(req.user.id);
+    const effective = jimengSessionService.resolveEffectiveSession(req.user.id);
+    res.json({ success: true, data: { accounts, effective } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/settings/session-accounts - 新增 SessionID 账号
+app.post('/api/settings/session-accounts', authenticate, (req, res) => {
+  try {
+    const account = jimengSessionService.createUserAccount(req.user.id, req.body || {});
+    res.json({ success: true, data: account });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// PUT /api/settings/session-accounts/:id - 更新 SessionID 账号
+app.put('/api/settings/session-accounts/:id', authenticate, (req, res) => {
+  try {
+    const account = jimengSessionService.updateUserAccount(
+      req.user.id,
+      Number(req.params.id),
+      req.body || {}
+    );
+    res.json({ success: true, data: account });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// DELETE /api/settings/session-accounts/:id - 删除 SessionID 账号
+app.delete('/api/settings/session-accounts/:id', authenticate, (req, res) => {
+  try {
+    const result = jimengSessionService.deleteUserAccount(req.user.id, Number(req.params.id));
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/settings/session-accounts/:id/default - 设为默认账号
+app.post('/api/settings/session-accounts/:id/default', authenticate, (req, res) => {
+  try {
+    const account = jimengSessionService.setDefaultAccount(req.user.id, Number(req.params.id));
+    res.json({ success: true, data: account });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/settings/session-accounts/test - 测试 SessionID
+app.post('/api/settings/session-accounts/test', authenticate, async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'SessionID 不能为空' });
+    }
+
+    const result = await jimengSessionService.testSessionId(sessionId);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// -------------------- 下载 API --------------------
+// GET /api/download/file?path=xxx - 下载文件
+app.get('/api/download/file', async (req, res) => {
+  try {
+    const filePath = req.query.path;
+    if (!filePath) {
+      return res.status(400).json({ error: '文件路径不能为空' });
+    }
+
+    const fs = await import('fs');
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: '文件不存在' });
+    }
+
+    res.download(filePath);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function sendDownloadedVideoFile(res, result) {
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(result.filename)}`);
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.download(result.filePath, result.filename);
+}
+
+// POST /api/download/tasks/:id/file-token - 创建一次性下载 token
+app.post('/api/download/tasks/:id/file-token', authenticate, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const result = videoDownloader.getDownloadedVideoFileByTaskId(taskId);
+
+    if (!result.success) {
+      const statusCode = result.error === '任务不存在'
+        ? 404
+        : result.error === '任务尚未下载到服务器' || result.error === '视频文件不存在，可能已被删除'
+          ? 400
+          : 500;
+      return res.status(statusCode).json({ error: result.error });
+    }
+
+    const token = createDownloadToken(taskId, req.user.id);
+    res.json({ success: true, data: { token } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/download/file-by-token - 使用一次性 token 下载服务器本地已保存的视频文件
+app.get('/api/download/file-by-token', async (req, res) => {
+  try {
+    const token = String(req.query.token || '');
+    const userIdParam = req.query.userId;
+    const userId = userIdParam === undefined || userIdParam === null || userIdParam === ''
+      ? null
+      : Number(userIdParam);
+    if (!token) {
+      return res.status(400).json({ error: '下载参数无效' });
+    }
+
+    const record = consumeDownloadToken(token, Number.isFinite(userId) ? userId : null);
+    if (!record) {
+      return res.status(401).json({ error: '下载链接已失效，请重试' });
+    }
+
+    const result = videoDownloader.getDownloadedVideoFileByTaskId(record.taskId);
+    if (!result.success) {
+      const statusCode = result.error === '任务不存在'
+        ? 404
+        : result.error === '任务尚未下载到服务器' || result.error === '视频文件不存在，可能已被删除'
+          ? 400
+          : 500;
+      return res.status(statusCode).json({ error: result.error });
+    }
+
+    sendDownloadedVideoFile(res, result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/download/tasks/:id/file - 下载服务器本地已保存的视频文件
+app.get('/api/download/tasks/:id/file', authenticate, async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const result = videoDownloader.getDownloadedVideoFileByTaskId(taskId);
+
+    if (!result.success) {
+      const statusCode = result.error === '任务不存在'
+        ? 404
+        : result.error === '任务尚未下载到服务器' || result.error === '视频文件不存在，可能已被删除'
+          ? 400
+          : 500;
+      return res.status(statusCode).json({ error: result.error });
+    }
+
+    sendDownloadedVideoFile(res, result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 下载管理 API 路由
+// ============================================================
+
+// GET /api/download/tasks - 获取下载任务列表
+app.get('/api/download/tasks', authenticate, (req, res) => {
+  try {
+    const { status = 'all', type = 'all', page = 1, pageSize = 20 } = req.query;
+    const isAdmin = req.user.role === 'admin';
+    const result = videoDownloader.getDownloadTasks({
+      status,
+      type,
+      page: parseInt(page),
+      pageSize: parseInt(pageSize),
+      userId: req.user.id,
+      isAdmin,
+    });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/download/refresh - 刷新下载任务列表（使用 get_local_item_list 获取已生成的视频）
+app.post('/api/download/refresh', authenticate, async (req, res) => {
+  try {
+    const db = getDatabase();
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    const sessionId = resolvedSession.sessionId;
+    const isAdmin = req.user.role === 'admin';
+
+    if (!sessionId) {
+      return res.status(400).json({ error: getMissingSessionErrorMessage() });
+    }
+
+    // 非管理员用户只能刷新自己的任务
+    const userWhereClause = isAdmin ? '' : 'AND t.user_id = ?';
+    const userParams = isAdmin ? [] : [req.user.id];
+
+    const tasks = db.prepare(`
+      SELECT t.id, t.history_id, t.item_id, t.status, t.video_url, t.created_at
+      FROM tasks t
+      WHERE t.task_kind = 'output'
+        AND t.history_id IS NOT NULL
+        AND t.video_url IS NULL
+        AND t.status != 'cancelled'
+        ${userWhereClause}
+    `).all(...userParams);
+
+    if (tasks.length === 0) {
+      return res.json({
+        success: true,
+        data: {
+          refreshed: 0,
+          total: 0,
+          generating: 0,
+          generatingTasks: [],
+          message: '没有需要刷新的任务',
+        },
+      });
+    }
+
+    const historyIds = tasks.map((task) => String(task.history_id));
+    const itemIdByHistoryId = await resolveItemIdsByHistoryIds(sessionId, historyIds);
+    const itemIds = [...new Set(tasks.map((task) => task.item_id || itemIdByHistoryId.get(String(task.history_id)) || null).filter(Boolean).map(String))];
+    const items = await fetchLocalItemsByItemIds(sessionId, itemIds);
+
+    const itemByItemId = new Map();
+    const itemByHistoryId = new Map();
+    for (const item of items) {
+      const itemId = extractItemId(item);
+      const historyId = extractHistoryId(item);
+      if (itemId) {
+        itemByItemId.set(String(itemId), item);
+      }
+      if (historyId) {
+        itemByHistoryId.set(String(historyId), item);
+      }
+    }
+
+    let refreshedCount = 0;
+    const generatingTasks = [];
+
+    for (const task of tasks) {
+      const historyId = String(task.history_id);
+      const itemId = String(task.item_id || itemIdByHistoryId.get(historyId) || '');
+      const item = (itemId && itemByItemId.get(itemId)) || itemByHistoryId.get(historyId) || null;
+      const videoUrl = item ? extractVideoUrl(item) : null;
+
+      persistResolvedVideoTask(db, task.id, {
+        itemId: itemId || null,
+        videoUrl,
+      });
+
+      if (videoUrl) {
+        refreshedCount++;
+      } else {
+        generatingTasks.push({
+          taskId: task.id,
+          historyId: task.history_id,
+          itemId: itemId || null,
+          createdAt: task.created_at,
+        });
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        refreshed: refreshedCount,
+        total: tasks.length,
+        generating: generatingTasks.length,
+        generatingTasks,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/download/sync-from-jimeng - 从即梦平台同步所有已生成的视频记录
+app.post('/api/download/sync-from-jimeng', authenticate, async (req, res) => {
+  try {
+    const db = getDatabase();
+    // 使用用户的即梦 SessionID（而非登录 session）
+    const resolvedSession = jimengSessionService.resolveEffectiveSession(req.user.id);
+    const sessionId = resolvedSession.sessionId;
+
+    if (!sessionId) {
+      return res.status(400).json({ error: getMissingSessionErrorMessage() });
+    }
+
+    const localTasks = db.prepare(`
+      SELECT id, history_id, video_url FROM tasks WHERE history_id IS NOT NULL
+    `).all();
+    const localTaskMap = new Map(localTasks.map((task) => [task.history_id, task]));
+    const defaultProject = ensureDefaultProjectForUser(req.user.id);
+
+    const pickFirstArray = (...values) =>
+      values.find((value) => Array.isArray(value) && value.length >= 0) || [];
+
+    const extractItemId = (item) =>
+      item?.item_id ||
+      item?.local_item_id ||
+      item?.common_attr?.id ||
+      item?.id ||
+      null;
+
+    const extractHistoryId = (item) =>
+      item?.history_id ||
+      item?.history_record_id ||
+      item?.common_attr?.history_id ||
+      item?.item_base?.history_id ||
+      null;
+
+    const extractPrompt = (item, fallbackId) =>
+      item?.prompt ||
+      item?.desc ||
+      item?.description ||
+      item?.common_attr?.prompt ||
+      item?.common_attr?.desc ||
+      `即梦作品 ${fallbackId}`;
+
+    const extractVideoUrl = (item) =>
+      item?.video?.transcoded_video?.origin?.video_url ||
+      item?.video?.download_url ||
+      item?.video?.play_url ||
+      item?.video?.url ||
+      item?.video?.play_addr?.url_list?.[0] ||
+      item?.item_video?.url ||
+      null;
+
+    const chunkArray = (items, size) => {
+      const chunks = [];
+      for (let i = 0; i < items.length; i += size) {
+        chunks.push(items.slice(i, i + size));
+      }
+      return chunks;
+    };
+
+    const assetResult = await jimengRequest(
+      'post',
+      '/mweb/v1/get_asset_list',
+      sessionId,
+      { data: {} }
+    );
+
+    const assetItems = pickFirstArray(
+      assetResult?.asset_list,
+      assetResult?.item_list,
+      assetResult?.list,
+      assetResult?.data?.asset_list,
+      assetResult?.data?.item_list,
+      assetResult?.data?.list
+    );
+
+    if (assetItems.length === 0) {
+      return res.json({
+        success: true,
+        data: { synced: 0, total: 0, message: '即梦平台暂无可同步作品' },
+      });
+    }
+
+    const normalizedAssets = [];
+    const seenKeys = new Set();
+
+    for (const item of assetItems) {
+      const itemId = extractItemId(item);
+      const historyId = extractHistoryId(item);
+      const uniqueKey = historyId || itemId;
+
+      if (!uniqueKey || seenKeys.has(uniqueKey)) {
+        continue;
+      }
+
+      seenKeys.add(uniqueKey);
+      normalizedAssets.push({
+        itemId: itemId ? String(itemId) : null,
+        historyId: historyId ? String(historyId) : null,
+        prompt: extractPrompt(item, uniqueKey),
+        videoUrl: extractVideoUrl(item),
+      });
+    }
+
+    const detailByItemId = new Map();
+    const detailByHistoryId = new Map();
+    const itemIds = normalizedAssets
+      .map((item) => item.itemId)
+      .filter(Boolean);
+
+    for (const chunk of chunkArray(itemIds, 20)) {
+      const detailResult = await jimengRequest(
+        'post',
+        '/mweb/v1/get_local_item_list',
+        sessionId,
+        {
+          data: {
+            item_id_list: chunk,
+            pack_item_opt: {
+              scene: 1,
+              need_data_integrity: true,
+            },
+            is_for_video_download: true,
+          },
+        }
+      );
+
+      const detailItems = pickFirstArray(
+        detailResult?.item_list,
+        detailResult?.local_item_list,
+        detailResult?.list,
+        detailResult?.data?.item_list,
+        detailResult?.data?.local_item_list,
+        detailResult?.data?.list
+      );
+
+      for (const item of detailItems) {
+        const itemId = extractItemId(item);
+        const historyId = extractHistoryId(item);
+        const videoUrl = extractVideoUrl(item);
+
+        if (itemId) {
+          detailByItemId.set(String(itemId), {
+            historyId: historyId ? String(historyId) : null,
+            videoUrl,
+          });
+        }
+
+        if (historyId) {
+          detailByHistoryId.set(String(historyId), {
+            itemId: itemId ? String(itemId) : null,
+            videoUrl,
+          });
+        }
+      }
+    }
+
+    let syncedCount = 0;
+    const syncedItems = [];
+
+    for (const item of normalizedAssets) {
+      const detail =
+        (item.itemId && detailByItemId.get(item.itemId)) ||
+        (item.historyId && detailByHistoryId.get(item.historyId)) ||
+        null;
+
+      const historyId = detail?.historyId || item.historyId;
+      const videoUrl = detail?.videoUrl || item.videoUrl;
+
+      if (!historyId || !videoUrl) {
+        continue;
+      }
+
+      const existingTask = localTaskMap.get(historyId);
+
+      if (existingTask) {
+        if (!existingTask.video_url) {
+          db.prepare(`
+            UPDATE tasks
+            SET video_url = ?, status = 'done', completed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(videoUrl, existingTask.id);
+          syncedCount++;
+          syncedItems.push({
+            taskId: existingTask.id,
+            historyId,
+            action: 'updated',
+          });
+        }
+        continue;
+      }
+
+      const createdTask = taskService.createTask({
+        projectId: defaultProject.id,
+        userId: req.user.id,
+        prompt: item.prompt,
+        taskKind: 'output',
+        status: 'done',
+        historyId: historyId,
+        itemId: item.itemId,
+        videoUrl,
+        downloadStatus: 'pending',
+        completedAt: new Date().toISOString(),
+      });
+
+      localTaskMap.set(historyId, {
+        id: createdTask.id,
+        history_id: historyId,
+        video_url: videoUrl,
+      });
+
+      syncedCount++;
+      syncedItems.push({
+        taskId: createdTask.id,
+        historyId,
+        action: 'created',
+        prompt: item.prompt,
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        synced: syncedCount,
+        total: normalizedAssets.length,
+        items: syncedItems.slice(0, 20),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/download/tasks/:id - 下载单个任务视频
+app.post('/api/download/tasks/:id', async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const db = getDatabase();
+
+    // 获取任务信息
+    const task = db.prepare(`
+      SELECT t.*, p.name as project_name
+      FROM tasks t
+      LEFT JOIN projects p ON t.project_id = p.id
+      WHERE t.id = ?
+    `).get(taskId);
+
+    if (!task) {
+      return res.status(404).json({ error: '任务不存在' });
+    }
+
+    if (!task.video_url) {
+      return res.status(400).json({ error: '视频仍在生成中，暂时无法下载' });
+    }
+
+    // 更新状态为 downloading
+    videoDownloader.updateDownloadStatus(taskId, 'downloading');
+
+    // 获取下载路径
+    const baseDownloadPath = videoDownloader.getDefaultDownloadPath();
+
+    // 下载视频
+    const result = await videoDownloader.downloadVideoByTaskId(taskId, baseDownloadPath);
+
+    if (result.success) {
+      videoDownloader.updateDownloadStatus(taskId, 'done', { downloadPath: result.path });
+      res.json({ success: true, data: { path: result.path, size: result.size } });
+    } else {
+      videoDownloader.updateDownloadStatus(taskId, 'failed', { error: result.error });
+      res.status(500).json({ error: result.error });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/download/batch - 批量下载视频
+app.post('/api/download/batch', async (req, res) => {
+  try {
+    const { taskIds } = req.body;
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      return res.status(400).json({ error: 'taskIds 必须是非空数组' });
+    }
+
+    const baseDownloadPath = videoDownloader.getDefaultDownloadPath();
+    const results = await videoDownloader.batchDownloadVideos(taskIds, baseDownloadPath);
+
+    // 更新下载状态
+    const db = getDatabase();
+    for (const result of results) {
+      if (result.success) {
+        videoDownloader.updateDownloadStatus(result.taskId, 'done', { downloadPath: result.path });
+      } else {
+        videoDownloader.updateDownloadStatus(result.taskId, 'failed', { error: result.error });
+      }
+    }
+
+    res.json({ success: true, data: results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/download/tasks/:id/open - 打开视频所在文件夹
+app.post('/api/download/tasks/:id/open', async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const db = getDatabase();
+
+    const task = db.prepare('SELECT video_path FROM tasks WHERE id = ?').get(taskId);
+    if (!task || !task.video_path) {
+      return res.status(404).json({ error: '任务不存在或未下载' });
+    }
+
+    const result = await videoDownloader.openVideoFolder(task.video_path);
+    if (result.success) {
+      res.json({ success: true });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/download/tasks/:id - 删除任务
+app.delete('/api/download/tasks/:id', (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const db = getDatabase();
+
+    // 删除任务（外键会自动删除 task_assets 和 generation_history）
+    db.prepare('DELETE FROM tasks WHERE id = ?').run(taskId);
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 认证相关 API
+// ============================================================
+
+// POST /api/auth/register - 用户注册
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, emailCode } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: '邮箱和密码不能为空' });
+    }
+
+    const result = await authService.registerUser(email, password, emailCode);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/auth/login - 用户登录
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: '邮箱和密码不能为空' });
+    }
+
+    const result = await authService.loginUser(email, password);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(401).json({ error: error.message });
+  }
+});
+
+// POST /api/auth/logout - 用户登出
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const sessionId = req.headers['x-session-id'];
+    if (sessionId) {
+      await authService.logoutUser(sessionId);
+    }
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/auth/me - 获取当前用户信息
+app.get('/api/auth/me', authenticate, async (req, res) => {
+  try {
+    res.json({ success: true, data: { user: req.user } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/auth/me - 更新当前用户信息
+app.put('/api/auth/me', authenticate, async (req, res) => {
+  try {
+    // 预留扩展功能
+    res.json({ success: true, data: { user: req.user } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/auth/password - 修改密码
+app.put('/api/auth/password', authenticate, async (req, res) => {
+  try {
+    const { oldPassword, newPassword } = req.body;
+
+    if (!oldPassword || !newPassword) {
+      return res.status(400).json({ error: '原密码和新密码不能为空' });
+    }
+
+    await authService.changePassword(req.user.id, oldPassword, newPassword);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/auth/email-code - 发送邮箱验证码
+app.post('/api/auth/email-code', async (req, res) => {
+  try {
+    const { email, purpose = 'register' } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: '邮箱不能为空' });
+    }
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: '邮箱格式不正确' });
+    }
+
+    // 获取请求 IP
+    const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+
+    // 开发环境下返回验证码，生产环境应该发送邮件
+    const result = await authService.generateAndSaveVerificationCode(email, purpose, ip);
+    res.json(result); // 生产环境不返回 debugCode
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/auth/email-status - 检查邮箱状态
+app.post('/api/auth/email-status', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: '邮箱不能为空' });
+    }
+
+    const result = await authService.checkEmailStatus(email);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/auth/verify-email-code - 验证邮箱验证码
+app.post('/api/auth/verify-email-code', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ error: '邮箱和验证码不能为空' });
+    }
+
+    const result = await authService.verifyEmailCode(email, code);
+    if (result.valid) {
+      res.json({ success: true });
+    } else {
+      res.status(400).json({ error: result.message });
+    }
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/credits/deduct - 扣减积分
+app.post('/api/credits/deduct', authenticate, async (req, res) => {
+  try {
+    const { amount } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: '积分数量无效' });
+    }
+
+    const result = await authService.deductCredits(req.user.id, amount);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/credits/add - 充值积分（管理员可用）
+app.post('/api/credits/add', authenticate, async (req, res) => {
+  try {
+    const { userId, amount } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: '积分数量无效' });
+    }
+
+    const targetUserId = userId || req.user.id;
+    const result = await authService.rechargeCredits(targetUserId, amount);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// POST /api/credits/checkin - 每日签到
+app.post('/api/credits/checkin', authenticate, async (req, res) => {
+  try {
+    const result = await authService.checkIn(req.user.id);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// GET /api/credits/checkin/status - 获取签到状态
+app.get('/api/credits/checkin/status', authenticate, async (req, res) => {
+  try {
+    const result = await authService.getCheckInStatus(req.user.id);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 管理员 API
+// ============================================================
+
+// GET /api/admin/stats - 获取系统统计
+app.get('/api/admin/stats', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const stats = await authService.getSystemStats();
+    res.json({ success: true, data: stats });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/admin/users - 获取用户列表
+app.get('/api/admin/users', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, pageSize = 20, role, status, email } = req.query;
+    const result = await authService.getUserList(
+      parseInt(page),
+      parseInt(pageSize),
+      { role, status, email }
+    );
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/admin/users/:id - 获取用户详情
+app.get('/api/admin/users/:id', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const user = await authService.getUserDetail(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/admin/users/:id/status - 更新用户状态
+app.put('/api/admin/users/:id/status', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { status } = req.body;
+
+    await authService.updateUserStatus(userId, status);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// PUT /api/admin/users/:id/credits - 修改用户积分
+app.put('/api/admin/users/:id/credits', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { credits, operation = 'set' } = req.body;
+
+    await authService.updateUserCredits(userId, credits, operation);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// PUT /api/admin/users/:id/password - 重置用户密码
+app.put('/api/admin/users/:id/password', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const userId = req.params.id;
+    const { newPassword } = req.body;
+
+    await authService.resetUserPassword(userId, newPassword);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+// GET /api/admin/works - 获取作品列表（预留）
+app.get('/api/admin/works', authenticate, requireAdmin, async (req, res) => {
+  try {
+    // 预留作品管理功能
+    res.json({ success: true, data: { works: [], pagination: { total: 0 } } });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// PUT /api/admin/works/:id/featured - 切换作品推荐状态（预留）
+app.put('/api/admin/works/:id/featured', authenticate, requireAdmin, async (req, res) => {
+  try {
+    // 预留作品推荐功能
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// 系统配置接口（SMTP 等）
+// ============================================================
+
+// GET /api/admin/config - 获取系统配置
+app.get('/api/admin/config', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const db = getDatabase();
+    const configs = db.prepare('SELECT key, value, description FROM system_config').all();
+    const configObj = {};
+    for (const c of configs) {
+      configObj[c.key] = { value: c.value, description: c.description };
+    }
+    res.json({ success: true, data: configObj });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/admin/config - 保存系统配置
+app.post('/api/admin/config', authenticate, requireAdmin, async (req, res) => {
+  try {
+    const db = getDatabase();
+    const { configs } = req.body; // { smtp_host: 'value', smtp_port: 'value', ... }
+
+    if (!configs || typeof configs !== 'object') {
+      return res.status(400).json({ error: '配置数据格式错误' });
+    }
+
+    const smtpConfigKeys = ['smtp_host', 'smtp_port', 'smtp_secure', 'smtp_user', 'smtp_pass', 'smtp_from', 'smtp_from_name', 'smtp_tls_reject_unauthorized'];
+    const descriptions = {
+      smtp_host: 'SMTP 服务器地址',
+      smtp_port: 'SMTP 端口号',
+      smtp_secure: '是否启用 SSL（true/false）',
+      smtp_user: 'SMTP 用户名',
+      smtp_pass: 'SMTP 密码/授权码',
+      smtp_from: '发件人邮箱',
+      smtp_from_name: '发件人名称',
+      smtp_tls_reject_unauthorized: 'TLS 证书校验（true/false）'
+    };
+
+    for (const [key, value] of Object.entries(configs)) {
+      if (smtpConfigKeys.includes(key)) {
+        const description = descriptions[key] || '';
+        db.prepare(`
+          INSERT INTO system_config (key, value, description)
+          VALUES (?, ?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = ?, description = ?, updated_at = datetime('now')
+        `).run(key, String(value), description, String(value), description);
+      }
+    }
+
+    // 清除邮件传输器缓存，以便重新加载配置
+    const { resetMailTransporterCache } = await import('./services/authService.js');
+    if (resetMailTransporterCache) resetMailTransporterCache();
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', mode: 'direct-jimeng-api' });
 });
@@ -1113,11 +3020,17 @@ if (process.env.NODE_ENV === 'production') {
 // 优雅关闭: 清理浏览器进程
 process.on('SIGTERM', () => {
   console.log('[server] 收到 SIGTERM，正在关闭...');
-  browserService.close().finally(() => process.exit(0));
+  browserService.close().finally(() => {
+    closeDatabase();
+    process.exit(0);
+  });
 });
 process.on('SIGINT', () => {
   console.log('[server] 收到 SIGINT，正在关闭...');
-  browserService.close().finally(() => process.exit(0));
+  browserService.close().finally(() => {
+    closeDatabase();
+    process.exit(0);
+  });
 });
 
 app.listen(PORT, () => {

@@ -30,7 +30,6 @@ class BrowserService {
         '--disable-gpu',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
       ],
     });
     console.log('[browser] Chromium 已启动');

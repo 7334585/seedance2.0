@@ -4,142 +4,298 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-Seedance 2.0 Web — 基于 React 前端 + Express 后端的 AI 视频生成应用。后端直接对接 jimeng.jianying.com（即梦）API，实现 Seedance 2.0 模型的"全能参考"视频生成，包括图片上传（ImageX CDN）、任务提交、轮询获取结果。
+Seedance 2.0 Web 是一个 React + TypeScript 前端、Express + SQLite 后端的 AI 视频生成应用。本地代码已经不再是早期单页面 + 单 SessionID 的形态，而是包含：
+
+- 用户注册 / 登录 / 登出 / 改密 / 积分
+- 左侧导航 + 多页面路由
+- 项目 / 任务 / 批量管理
+- 下载管理
+- 管理员后台
+- 多即梦 Session 账号管理
+- 严格的用户归属隔离（ownership）
+
+当前文档必须以本地代码为准，不要再沿用旧 GitHub 时代的描述。
+
+## 当前实现与旧文档的关键差异
+
+以下几点是最容易写错的地方：
+
+1. 类型入口已经是 `src/types/index.ts`，不是 `src/types.ts`
+2. 平台登录会话存于 localStorage 键 `seedance_session_id`
+3. 用户缓存键为 `seedance_user_cache`
+4. 前端鉴权头使用 `X-Session-ID`
+5. 项目 / 任务 / 批量 / 下载已按用户归属隔离，普通用户不能查看或操作其他用户的数据
+6. 任务模型已扩展为 `draft -> output*` 双层结构，而不是旧版单层任务
+7. 即梦 Session 已演进为“每用户多账号”模型，解析优先级为 `user_default > legacy_global > env_default > none`
+8. 浏览器下载本地视频走 token 链路，不是直接暴露本地文件路径
+9. `AppProvider` 会随 `currentUser` 变化清空并重载项目、任务、设置状态
 
 ## 常用命令
 
 ```bash
-# 安装所有依赖（前端 + 服务端各自的 node_modules）
+# 安装前后端依赖
 npm run install:all
 
-# 开发模式（同时启动 Vite 前端 :5173 + Express 后端 :3001）
+# 同时启动前端 :5173 与后端 :3001
 npm run dev
 
-# 仅启动前端
+# 单独启动前端 / 后端
 npm run dev:client
-
-# 仅启动后端
 npm run dev:server
 
-# 类型检查（仅覆盖 src/ 目录，后端为纯 JS 不参与）
+# 前端类型检查
 npx tsc --noEmit
 
-# 生产构建（先 tsc 类型检查，再 vite build）
+# 前端构建
 npm run build
 
-# 生产启动（Express 同时提供前端静态文件 + API）
+# 生产启动
 npm start
 ```
 
-当前未配置测试框架和 linter。
+当前仓库未配置测试框架和 linter。
 
-## 架构
+## 前端结构
 
-### 双 package.json 结构
+```text
+src/
+├── main.tsx
+├── App.tsx
+├── index.css
+├── types/
+│   └── index.ts
+├── context/
+│   └── AppContext.tsx
+├── components/
+│   ├── Sidebar.tsx
+│   ├── VideoPlayer.tsx
+│   └── Icons.tsx
+├── pages/
+│   ├── LoginPage.tsx
+│   ├── RegisterPage.tsx
+│   ├── SingleTaskPage.tsx
+│   ├── BatchManagement.tsx
+│   ├── DownloadManagement.tsx
+│   ├── Settings.tsx
+│   └── AdminPage.tsx
+└── services/
+    ├── authService.ts
+    ├── videoService.ts
+    ├── projectService.ts
+    ├── taskService.ts
+    ├── batchService.ts
+    ├── downloadService.ts
+    └── settingsService.ts
+```
 
-- 根目录 `package.json` — 前端依赖（React、Vite、Tailwind）+ 开发脚本
-- `server/package.json` — 后端独立依赖（Express、multer、cors、dotenv、playwright-core）
-- `npm run install:all` 会分别安装两处依赖
-- 首次运行需执行 `npx playwright-core install chromium` 安装无头浏览器
+### 路由真值
 
-### 双进程开发模式
+`src/App.tsx` 当前路由：
 
-- **Vite 开发服务器** (`:5173`) — 提供 React 前端，通过 `vite.config.ts` 将 `/api/*` 请求代理到 Express
-- **Express 后端** (`:3001`) — 直接对接 jimeng.jianying.com API，处理图片上传、视频生成、任务轮询
+- `/login`
+- `/register`
+- `/`
+- `/batch`
+- `/download`
+- `/settings`
+- `/admin`
+- `* -> /`
 
-### 前端（React 19 + TypeScript strict + Tailwind CSS 3）
+`/admin` 仅管理员可访问；未登录用户会被 `ProtectedRoute` 重定向到 `/login`。
 
-左右分栏布局：左侧配置面板，右侧视频播放区。TypeScript 开启了 strict、noUnusedLocals、noUnusedParameters。
+### 认证与前端状态
 
-- `src/App.tsx` — 根组件，`useState` 管理所有状态（无外部状态库），包含图片上传、提示词输入、模型选择、参考模式/画面比例/时长选择、生成按钮等全部 UI 逻辑
-- `src/types.ts` — 共享 TypeScript 类型定义和常量数组（`RATIO_OPTIONS`、`DURATION_OPTIONS`、`REFERENCE_MODES`、`MODEL_OPTIONS`）
-- `src/services/videoService.ts` — `generateVideo()` 函数，实现异步任务模式：POST 提交获取 taskId，然后轮询 GET 获取结果（3秒间隔，最长25分钟）
-- `src/components/VideoPlayer.tsx` — 视频播放组件，通过 `/api/video-proxy` 代理 CDN 视频 URL 解决 CORS 问题
-- `src/components/SettingsModal.tsx` — 设置弹窗，管理 sessionId；导出 `loadSettings()` 从 `localStorage` 读取配置
-- `src/components/Icons.tsx` — SVG 图标组件集合
-- `src/components/{UploadArea,PromptInput,RatioSelector,DurationSelector,Toolbar}.tsx` — 已提取但当前未被 App.tsx 引用的组件文件
+前端存在两套不同语义的会话：
 
-### 后端（`server/index.js` + `server/browser-service.js`，纯 JavaScript ESM）
+1. **平台登录会话**
+   - localStorage: `seedance_session_id`
+   - 用户缓存: `seedance_user_cache`
+   - 请求头: `X-Session-ID`
+   - 来源：`src/services/authService.ts`
 
-后端由两个模块组成，不使用 TypeScript。直接对接 jimeng.jianying.com API，无需中间代理服务。
+2. **即梦 Session 账号**
+   - 存储在数据库表 `jimeng_session_accounts`
+   - 通过设置页管理
+   - 用于后端访问即梦平台
 
-**API 接口：**
-- `POST /api/generate-video` — 接收 multipart form-data（prompt、model、ratio、duration、sessionId、files），异步启动生成任务，立即返回 `{ taskId }`。文件限制：单文件最大 20MB，最多 5 个文件。
-- `GET /api/task/:taskId` — 查询任务状态，返回 `{ status: 'processing'|'done'|'error', progress?, result?, error? }`
-- `GET /api/video-proxy?url=` — 代理 CDN 视频流，解决浏览器 CORS 限制
-- `GET /api/health` — 健康检查
+`src/context/AppContext.tsx` 已实现登录态切换时的状态清理：
 
-**核心函数：**
-- `jimengRequest()` — 封装即梦 API 请求，自动注入 Cookie、Sign、请求头，内置 3 次重试（仅网络错误重试，API 业务错误直接抛出）
-- `generateCookie()` / `generateSign()` — 基于 sessionId 生成认证 Cookie 和 MD5 签名
-- `createAWSSignature()` — AWS4-HMAC-SHA256 签名，用于 ImageX CDN 上传
-- `uploadImageBuffer()` — 四步 ImageX 上传流程：获取 token → 申请权限 → 上传二进制数据 → 提交确认
-- `buildMetaListFromPrompt()` — 解析 prompt 中的 `@1`、`@2` 占位符，生成 material_list 和 meta_list
-- `generateSeedanceVideo()` — 完整的视频生成流程：上传图片 → 通过浏览器代理提交生成任务 → 轮询结果 → 获取高清 URL
-- `calculateCRC32()` — 计算上传数据的 CRC32 校验值
+- 无用户时清空 `projects`
+- 清空 `currentProject`
+- 清空 `tasks`
+- 清空 `currentTask`
+- 清空 `error`
+- 结束 `loading`
+- 将 `settings` 重置为 `{}`
 
-**浏览器代理服务（`server/browser-service.js`）：**
-- `BrowserService` 类 — 管理 Playwright 无头 Chromium 浏览器，用于绕过即梦 shark 反爬机制
-- 仅 `/mweb/v1/aigc_draft/generate` 接口通过浏览器代理发送请求，其他接口仍使用 Node.js 直接请求
-- 原理：在真实浏览器环境中加载 jimeng.jianying.com，bdms SDK 自动拦截 fetch 请求并注入 `a_bogus` 签名
-- 按 sessionId 隔离浏览器上下文，10 分钟空闲自动回收
-- 屏蔽图片/字体/样式等非必要资源，仅保留 bdms SDK 相关脚本域名白名单
-- 首次请求启动浏览器约 3-5 秒，后续请求复用会话无额外延迟
+因此修改认证、退出登录、切换用户相关逻辑时，要同时检查：
 
-**模型映射：**
-- `seedance-2.0` → `dreamina_seedance_40_pro` (benefit: `dreamina_video_seedance_20_pro`)
-- `seedance-2.0-fast` → `dreamina_seedance_40` (benefit: `dreamina_seedance_20_fast`)
+- `src/App.tsx`
+- `src/context/AppContext.tsx`
+- `src/services/authService.ts`
 
-**任务管理：**
-- 使用内存 Map 存储任务状态，30 分钟自动清理过期任务
-- 已完成/失败的任务在返回后 5 分钟清理
-- 前端轮询间隔 3 秒，最大轮询时长 25 分钟
+## 后端结构
 
-## 配置
+```text
+server/
+├── index.js
+├── browser-service.js
+├── database/
+│   ├── index.js
+│   └── schema.sql
+└── services/
+    ├── authService.js
+    ├── projectService.js
+    ├── taskService.js
+    ├── settingsService.js
+    ├── jimengSessionService.js
+    ├── batchScheduler.js
+    ├── videoDownloader.js
+    └── videoGenerator.js
+```
 
-复制 `.env.example` 为 `.env`，关键变量：
-- `VITE_DEFAULT_SESSION_ID` — 即梦 sessionid，从 jimeng.jianying.com 的 Cookie 中获取（也可在运行时通过界面设置弹窗配置）
-- `PORT` — Express 后端端口（默认 `3001`）
+## 权限与 ownership 规则
 
-SessionID 优先级：请求体中的 `sessionId` 字段 > `.env` 中的 `VITE_DEFAULT_SESSION_ID`。
+当前本地实现不是“大家都能看到所有项目”。正确规则是：
 
-## 即梦 API 接口约定
+- 管理员可查看全量项目、任务、批量和下载记录
+- 普通用户只能查看自己的项目、任务、批量和下载记录
+- 删除、更新、批量启动、批量详情查询都必须沿着归属链路校验
 
-**Seedance 2.0 模型参数：**
-- 画面比例：`21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16`
-- 时长：整数 4-15 秒
-- 参考图片：最多 5 张，通过 ImageX CDN 上传后以 URI 形式传入
-- prompt 中使用 `@1`、`@2` 等占位符引用图片
+排查 ownership 问题时优先看：
 
-**关键 API 路径：**
-- `POST /mweb/v1/aigc_draft/generate` — 提交视频生成任务
-- `POST /mweb/v1/get_history_by_ids` — 通过 history_id 查询生成状态
-- `POST /mweb/v1/get_local_item_list` — 获取高清视频 URL
+- `server/services/projectService.js`
+- `server/services/taskService.js`
+- `server/services/batchScheduler.js`
+- `src/services/projectService.ts`
+- `src/services/batchService.ts`
+- `src/services/downloadService.ts`
 
-**ImageX CDN 上传流程：**
-1. `GET /imagex/get_upload_token` — 获取上传凭证（通过即梦 API）
-2. `POST /imagex/apply_upload` — 申请上传权限（AWS 签名请求到 imagex.bytedanceapi.com）
-3. `POST /{upload_host}/{store_uri}` — 上传二进制数据（带 CRC32 校验）
-4. `POST /imagex/commit_upload` — 确认上传完成（AWS 签名请求）
+## 任务模型
 
-## 界面语言
+当前任务不是旧版单层任务，而是：
 
-所有用户可见文本为中文，代码和变量命名使用英文。
+- `draft`：草稿任务，承载 prompt / 素材 / 行号 / 计划输出数
+- `output`：从 draft 展开的实际生成任务
 
-## 注意事项
+关键字段位于 `src/types/index.ts` 与 `server/database/schema.sql`：
 
-- 后端直接与 jimeng.jianying.com 通信，不依赖 jimeng-free-api 等中间服务
-- 视频生成的 `/mweb/v1/aigc_draft/generate` 接口通过 Playwright 无头浏览器代理发送，其他接口直接请求
-- 首次运行需安装 Chromium：`npx playwright-core install chromium`，运行时需约 150-200MB 额外内存
-- 视频生成是异步任务模式，后端在内存中管理任务状态并轮询即梦 API
-- 浏览器无法直接播放即梦 CDN 视频（CORS），必须通过 `/api/video-proxy` 代理
-- 生产模式下 Express 同时提供 `dist/` 静态文件服务
-- 后端为纯 JavaScript，`npx tsc --noEmit` 仅检查 `src/` 下的前端代码
-- 服务器收到 SIGTERM/SIGINT 信号时会自动关闭 Chromium 进程
+- `task_kind`
+- `source_task_id`
+- `row_group_id`
+- `row_index`
+- `video_count`
+- `output_index`
 
-## 版本记录
+批量启动时，后端会校验任务是否：
 
-| 版本 | 日期 | 说明 |
-|------|------|------|
-| v0.0.1 | 2025-02-14 | 初始版本，支持 Seedance 2.0 / Fast 双模型视频生成、Docker 部署 |
-| v0.0.2 | 2026-02-21 | 修复 shark not pass 反爬拦截：引入 Playwright 无头浏览器代理，通过 bdms SDK 自动注入 a_bogus 签名绕过即梦 shark 安全检测 |
+- 属于当前项目
+- 属于当前用户（普通用户场景）
+- `task_kind === 'draft'`
+- 有 prompt
+- 至少有一张图片素材
+
+## 即梦 Session 账号模型
+
+即梦 Session 已经从“单全局 SessionID”演进为“每用户多账号”。
+
+相关表：
+
+- `jimeng_session_accounts`
+- `settings`（仅保留 legacy `session_id` 兼容项）
+
+解析优先级固定为：
+
+1. `user_default`
+2. `legacy_global`
+3. `env_default`
+4. `none`
+
+补充规则：
+
+- 用户新增的第一个账号自动设为默认
+- 删除默认账号后，系统会自动补一个新的默认账号
+- 设置页上的 `session-accounts` 接口显式要求登录态
+
+## 下载链路
+
+下载管理分成两类：
+
+1. **服务器侧下载到本地目录**
+   - `/api/download/tasks/:id`
+   - `/api/download/batch`
+   - `/api/download/refresh`
+   - `/api/download/sync-from-jimeng`
+
+2. **把服务器本地已保存的视频交给浏览器下载**
+   - 先 `POST /api/download/tasks/:id/file-token`
+   - 再访问 `GET /api/download/file-by-token?token=...`
+
+前端实现位于 `src/services/downloadService.ts`。
+
+写下载相关文档时，不要再写成“前端直接拿本地路径下载”。当前实现是一次性 token 下载链路。
+
+## API 认证边界说明
+
+以下描述以当前前端调用链为准：
+
+### 明确要求登录的前端调用
+
+- `projectService.ts` 全部项目接口
+- `taskService.ts` 全部任务 / 素材 / 生成 / 下载 / 采集接口
+- `batchService.ts` 全部批量接口
+- `downloadService.ts` 全部下载管理接口
+- `settingsService.ts` 的 `session-accounts` 相关接口
+- `videoService.ts` 提交 `/api/generate-video`
+
+### 需要谨慎描述的边界
+
+- `settingsService.ts` 中 `getSettings()` / `updateSettings()` 当前前端调用未显式附 `getAuthHeaders()`；修改或写文档前应先核对后端真实要求，不要笼统写成“所有 settings 接口统一鉴权”
+- `videoService.ts` 中轮询 `/api/task/:taskId` 当前前端调用未显式附 `X-Session-ID`；写文档时应表述为“当前前端提交生成请求走登录态，轮询接口按现有调用链单独说明”
+
+## 数据库真值
+
+优先以 `server/database/schema.sql` 为准。当前核心表包括：
+
+- `users`
+- `sessions`
+- `check_ins`
+- `email_verification_codes`
+- `system_config`
+- `projects`
+- `tasks`
+- `task_assets`
+- `generation_history`
+- `jimeng_session_accounts`
+- `settings`
+- `schedules`
+- `batches`
+
+其中最容易遗漏的是：
+
+- `projects.user_id`
+- `tasks.user_id`
+- `jimeng_session_accounts`
+- `system_config`
+- `email_verification_codes` 的增强字段（`purpose` / `code_hash` / `salt` / `attempts` / `request_ip` / `consumed_at`）
+
+## 开发注意事项
+
+- 前端所有用户可见文案为中文
+- 后端是纯 JavaScript ESM，`npx tsc --noEmit` 只检查前端 `src/`
+- 生产模式由 Express 同时提供前端静态资源和 API
+- Vite 开发环境通过 `/api -> :3001` 代理访问后端
+- 首次开发需要 `npx playwright-core install chromium`
+- 涉及权限、路由、状态切换时，优先核对源码，不要信任旧文档
+
+## 修改文档时的建议顺序
+
+如果后续继续更新文档，推荐按以下顺序核对：
+
+1. `server/database/schema.sql`
+2. `src/types/index.ts`
+3. `src/App.tsx`
+4. `src/context/AppContext.tsx`
+5. `src/services/*.ts`
+6. `server/services/*.js`
+7. `README.md` / `doc/*.md`
